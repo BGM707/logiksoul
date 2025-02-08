@@ -3,9 +3,56 @@ import numpy as np
 import sounddevice as sd
 import threading
 import soundfile as sf
+from scipy import signal
 
 # ==============================================================
-# Clase para generar y reproducir sonidos de batería
+# Funciones de efectos (simulaciones básicas)
+# ==============================================================
+
+def apply_reverb(sig, level):
+    """Simula una reverb simple mediante convolución con una respuesta de impulso exponencial."""
+    sr = 44100
+    duration = 0.1  # 100 ms
+    t = np.linspace(0, duration, int(sr * duration))
+    impulse = np.exp(-t * 10) * level
+    convolved = np.convolve(sig, impulse, mode="full")[:len(sig)]
+    return sig + convolved
+
+def apply_delay(sig, level, delay_time=0.3):
+    """Simula un delay básico: añade una versión retrasada del audio."""
+    sr = 44100
+    delay_samples = int(delay_time * sr)
+    delayed = np.pad(sig, (delay_samples, 0), mode="constant")[:len(sig)]
+    return sig + level * delayed
+
+def apply_eq(sig, gain):
+    """Simula un EQ simple mediante un filtro promedio (no es un EQ real)."""
+    kernel_size = 10
+    kernel = np.ones(kernel_size) / kernel_size * gain
+    return np.convolve(sig, kernel, mode="same")
+
+def apply_compression(sig, threshold, ratio):
+    """Simula una compresión básica: si la señal excede el umbral, se reduce su ganancia."""
+    compressed = np.copy(sig)
+    mask = np.abs(sig) > threshold
+    compressed[mask] = np.sign(sig[mask]) * (threshold + (np.abs(sig[mask]) - threshold) / ratio)
+    return compressed
+
+def apply_channel_effects(sig, channel):
+    """Aplica en cadena los efectos habilitados en un canal sobre la señal."""
+    processed = sig
+    if channel.get("delay", False):
+         processed = apply_delay(processed, channel.get("delay_level", 0.5))
+    if channel.get("reverb", False):
+         processed = apply_reverb(processed, channel.get("reverb_level", 0.5))
+    if channel.get("eq", False):
+         processed = apply_eq(processed, channel.get("eq_gain", 1.0))
+    if channel.get("comp", False):
+         processed = apply_compression(processed, channel.get("comp_threshold", 0.5), channel.get("comp_ratio", 4))
+    return processed
+
+# ==============================================================
+# Clase para sonidos de batería sintéticos
 # ==============================================================
 
 class DrumMachine:
@@ -14,7 +61,6 @@ class DrumMachine:
         self.duration = 0.15
 
     def create_kick(self):
-        # Genera un sonido de bombo (kick drum)
         t = np.linspace(0, self.duration, int(self.sample_rate * self.duration))
         frequency = np.linspace(150, 40, len(t))
         waveform = np.sin(2 * np.pi * frequency * t)
@@ -22,7 +68,6 @@ class DrumMachine:
         return (waveform * envelope * 0.5).astype(np.float32)
 
     def create_snare(self):
-        # Genera un sonido de redoblante (snare drum)
         t = np.linspace(0, self.duration, int(self.sample_rate * self.duration))
         noise = np.random.uniform(-1, 1, len(t))
         envelope = np.exp(-4 * t)
@@ -30,35 +75,43 @@ class DrumMachine:
         return (waveform * envelope * 0.5).astype(np.float32)
 
     def create_hihat(self):
-        # Genera un sonido de platillo (hi-hat)
         t = np.linspace(0, self.duration/2, int(self.sample_rate * self.duration/2))
         noise = np.random.uniform(-1, 1, len(t))
         envelope = np.exp(-15 * t)
         return (noise * envelope * 0.5).astype(np.float32)
 
     def play_sound(self, sound):
-        # Reproduce el sonido en un hilo separado
         sd.play(sound, self.sample_rate)
 
 # ==============================================================
-# Clase principal de la aplicación
+# Clase principal de la aplicación DAW
 # ==============================================================
 
 class DrumApp:
     def __init__(self):
         self.drum_machine = DrumMachine()
-        # Variables para grabación vía micrófono (pestaña Grabación)
+        # Variables para la pestaña de Grabación
         self.is_recording = False
         self.recording_stream = None
         self.recorded_frames = []
-        self.timeline_samples = []  # Muestras grabadas o cargadas en la pestaña "Grabación"
-        # Variables para pistas cargadas de archivos locales (pestaña Pistas)
-        self.track_samples = []     # Cada pista es un diccionario: data, offset, volumen, label
+        self.timeline_samples = []  # Grabaciones y samples en la línea de tiempo
+        # Variables para la pestaña de Pistas
+        self.track_samples = []  # Cada pista: {data, offset, volume, channel, label}
+        # Variables para la pestaña de Canales (Mixer)
+        self.channels = [
+            {
+                "name": "Master",
+                "output": "Master",
+                "reverb": False, "reverb_level": 0.5,
+                "delay": False, "delay_level": 0.5,
+                "eq": False, "eq_gain": 1.0,
+                "comp": False, "comp_threshold": 0.5, "comp_ratio": 4
+            }
+        ]
 
-    # --------------------------------------------------------------
-    # Funciones para la pestaña "Batería"
-    # --------------------------------------------------------------
-
+    # ---------------------------
+    # Pestaña "Batería"
+    # ---------------------------
     def play_instrument(self, e):
         sound = None
         if e.control.data == "kick":
@@ -70,10 +123,9 @@ class DrumApp:
         if sound is not None:
             threading.Thread(target=self.drum_machine.play_sound, args=(sound,)).start()
 
-    # --------------------------------------------------------------
-    # Funciones para la pestaña "Grabación"
-    # --------------------------------------------------------------
-
+    # ---------------------------
+    # Pestaña "Grabación"
+    # ---------------------------
     def start_recording(self, e, page: ft.Page):
         if self.is_recording:
             return
@@ -106,14 +158,12 @@ class DrumApp:
             self.recording_stream = None
 
         if self.recorded_frames:
-            # Concatenar todos los fragmentos grabados
             recording = np.concatenate(self.recorded_frames, axis=0).flatten()
             sample_index = len(self.timeline_samples) + 1
             sample_dict = {"data": recording, "offset": 0.0, "label": f"Grabación {sample_index}"}
             self.timeline_samples.append(sample_dict)
-            # Añadir el widget correspondiente en la línea de tiempo de grabación
-            sample_widget = self.create_sample_widget(sample_dict, timeline_row, page)
-            timeline_row.controls.append(sample_widget)
+            widget = self.create_sample_widget(sample_dict, timeline_row, page)
+            timeline_row.controls.append(widget)
             page.snack_bar = ft.SnackBar(ft.Text("Grabación finalizada y añadida"))
             page.snack_bar.open = True
             page.update()
@@ -149,18 +199,19 @@ class DrumApp:
             content=ft.Column(
                 controls=[
                     ft.Text(sample_dict["label"], color=ft.colors.WHITE),
-                    ft.Text("Offset (segundos)", color=ft.colors.WHITE, size=12),
+                    ft.Text("Offset (seg)", color=ft.colors.WHITE, size=12),
                     ft.Slider(min=0, max=10, value=sample_dict["offset"], on_change=slider_change),
-                    ft.ElevatedButton("Eliminar", on_click=delete_sample, bgcolor=ft.colors.ERROR)
+                    ft.ElevatedButton("Eliminar", on_click=delete_sample, bgcolor=ft.colors.RED)
                 ],
                 spacing=5,
                 alignment=ft.MainAxisAlignment.CENTER
             ),
-            width=200,
+            width=220,
             padding=10,
             bgcolor=ft.colors.BLUE_GREY_700,
             border_radius=10,
-            margin=5
+            # Simulamos sombra con margen y bordes redondeados
+            margin=10
         )
 
     def play_timeline(self, e, page: ft.Page):
@@ -169,7 +220,6 @@ class DrumApp:
             page.snack_bar.open = True
             page.update()
             return
-
         sr = self.drum_machine.sample_rate
         total_duration = 0
         samples = []
@@ -180,7 +230,6 @@ class DrumApp:
             samples.append((sample["data"], offset))
         total_samples = int(total_duration * sr)
         mix = np.zeros(total_samples, dtype=np.float32)
-
         for data, offset in samples:
             start_idx = int(offset * sr)
             end_idx = start_idx + len(data)
@@ -189,11 +238,9 @@ class DrumApp:
                 mix = np.pad(mix, (0, extra), 'constant')
                 total_samples = end_idx
             mix[start_idx:end_idx] += data
-
         max_val = np.max(np.abs(mix))
         if max_val > 0:
             mix = mix / max_val * 0.8
-
         threading.Thread(target=sd.play, args=(mix, sr)).start()
 
     def file_picker_result(self, e, timeline_row: ft.Row, page: ft.Page):
@@ -204,7 +251,7 @@ class DrumApp:
                 if len(data.shape) > 1:
                     data = np.mean(data, axis=1)
                 if sr != self.drum_machine.sample_rate:
-                    page.snack_bar = ft.SnackBar(ft.Text("El sample tiene una tasa de muestreo diferente"))
+                    page.snack_bar = ft.SnackBar(ft.Text("El sample tiene una tasa de muestreo distinta"))
                     page.snack_bar.open = True
                     page.update()
                     return
@@ -217,38 +264,38 @@ class DrumApp:
                 page.snack_bar.open = True
                 page.update()
             except Exception as ex:
-                page.snack_bar = ft.SnackBar(ft.Text(f"Error al cargar el sample: {ex}"))
+                page.snack_bar = ft.SnackBar(ft.Text(f"Error al cargar sample: {ex}"))
                 page.snack_bar.open = True
                 page.update()
 
-    # --------------------------------------------------------------
-    # Funciones para la pestaña "Pistas" (Multitrack)
-    # --------------------------------------------------------------
-
+    # ---------------------------
+    # Pestaña "Pistas" (Multitrack)
+    # ---------------------------
     def file_picker_tracks_result(self, e, track_column: ft.Column, page: ft.Page):
         if e.files:
             for file in e.files:
-                file_path = file.path
                 try:
-                    data, sr = sf.read(file_path, dtype='float32')
+                    data, sr = sf.read(file.path, dtype='float32')
                     if len(data.shape) > 1:
                         data = np.mean(data, axis=1)
                     if sr != self.drum_machine.sample_rate:
-                        page.snack_bar = ft.SnackBar(ft.Text(f"El archivo {file.name} tiene una tasa de muestreo diferente"))
+                        page.snack_bar = ft.SnackBar(ft.Text(f"{file.name} tiene tasa distinta"))
                         page.snack_bar.open = True
                         continue
                     track_index = len(self.track_samples) + 1
+                    # Por defecto, asigna la pista al canal "Master"
                     track_dict = {
                         "data": data,
                         "offset": 0.0,
                         "volume": 1.0,
+                        "channel": "Master",
                         "label": f"Pista {track_index}"
                     }
                     self.track_samples.append(track_dict)
                     widget = self.create_track_widget(track_dict, track_column, page)
                     track_column.controls.append(widget)
                 except Exception as ex:
-                    page.snack_bar = ft.SnackBar(ft.Text(f"Error al cargar {file.name}: {ex}"))
+                    page.snack_bar = ft.SnackBar(ft.Text(f"Error cargando {file.name}: {ex}"))
                     page.snack_bar.open = True
         page.update()
 
@@ -259,6 +306,9 @@ class DrumApp:
         def volume_change(e):
             track_dict["volume"] = e.control.value
 
+        def channel_change(e):
+            track_dict["channel"] = e.control.value
+
         def delete_track(e):
             if track_dict in self.track_samples:
                 index = self.track_samples.index(track_dict)
@@ -266,24 +316,32 @@ class DrumApp:
                 track_column.controls.pop(index)
                 page.update()
 
+        # Crear opciones del dropdown según los nombres de canales disponibles
+        channel_options = [ft.dropdown.Option(channel["name"]) for channel in self.channels]
         return ft.Container(
             content=ft.Column(
                 controls=[
                     ft.Text(track_dict["label"], color=ft.colors.WHITE),
-                    ft.Text("Offset (segundos)", color=ft.colors.WHITE, size=12),
+                    ft.Text("Offset (seg)", color=ft.colors.WHITE, size=12),
                     ft.Slider(min=0, max=30, value=track_dict["offset"], on_change=offset_change),
                     ft.Text("Volumen", color=ft.colors.WHITE, size=12),
                     ft.Slider(min=0, max=1, divisions=100, value=track_dict["volume"], on_change=volume_change),
-                    ft.ElevatedButton("Eliminar", on_click=delete_track, bgcolor=ft.colors.ERROR)
+                    ft.Text("Canal", color=ft.colors.WHITE, size=12),
+                    ft.Dropdown(
+                        options=channel_options,
+                        value=track_dict["channel"],
+                        on_change=channel_change
+                    ),
+                    ft.ElevatedButton("Eliminar", on_click=delete_track, bgcolor=ft.colors.RED)
                 ],
                 spacing=5,
                 alignment=ft.MainAxisAlignment.START
             ),
-            width=300,
+            width=320,
             padding=10,
             bgcolor=ft.colors.BLUE_GREY_700,
             border_radius=10,
-            margin=5
+            margin=10
         )
 
     def play_tracks(self, e, page: ft.Page):
@@ -295,30 +353,31 @@ class DrumApp:
 
         sr = self.drum_machine.sample_rate
         total_duration = 0
-        tracks = []
+        processed_tracks = []
         for track in self.track_samples:
             offset = track["offset"]
             data = track["data"]
             volume = track["volume"]
             length = len(data) / sr
             total_duration = max(total_duration, offset + length)
-            tracks.append((data, offset, volume))
+            # Buscar el canal asignado (por nombre)
+            channel = next((ch for ch in self.channels if ch["name"] == track["channel"]), None)
+            if channel is not None:
+                data = apply_channel_effects(data, channel)
+            processed_tracks.append((data * volume, offset))
         total_samples = int(total_duration * sr)
         mix = np.zeros(total_samples, dtype=np.float32)
-
-        for data, offset, volume in tracks:
+        for data, offset in processed_tracks:
             start_idx = int(offset * sr)
             end_idx = start_idx + len(data)
             if end_idx > total_samples:
                 extra = end_idx - total_samples
                 mix = np.pad(mix, (0, extra), 'constant')
                 total_samples = end_idx
-            mix[start_idx:end_idx] += data * volume
-
+            mix[start_idx:end_idx] += data
         max_val = np.max(np.abs(mix))
         if max_val > 0:
             mix = mix / max_val * 0.8
-
         threading.Thread(target=sd.play, args=(mix, sr)).start()
 
     def clear_tracks(self, e, page: ft.Page, track_column: ft.Column):
@@ -328,19 +387,116 @@ class DrumApp:
         page.snack_bar.open = True
         page.update()
 
-    # --------------------------------------------------------------
-    # Función principal: Construcción de la UI
-    # --------------------------------------------------------------
+    # ---------------------------
+    # Pestaña "Canales" (Mixer/Efectos)
+    # ---------------------------
+    def create_channel_widget(self, channel, channel_index, channels_column: ft.Column, page):
+        def name_change(e):
+            channel["name"] = e.control.value
+            page.update()
 
+        def output_change(e):
+            channel["output"] = e.control.value
+            page.update()
+
+        def toggle_reverb(e):
+            channel["reverb"] = e.control.value
+            page.update()
+
+        def reverb_level_change(e):
+            channel["reverb_level"] = e.control.value
+            page.update()
+
+        def toggle_delay(e):
+            channel["delay"] = e.control.value
+            page.update()
+
+        def delay_level_change(e):
+            channel["delay_level"] = e.control.value
+            page.update()
+
+        def toggle_eq(e):
+            channel["eq"] = e.control.value
+            page.update()
+
+        def eq_gain_change(e):
+            channel["eq_gain"] = e.control.value
+            page.update()
+
+        def toggle_comp(e):
+            channel["comp"] = e.control.value
+            page.update()
+
+        def comp_threshold_change(e):
+            channel["comp_threshold"] = e.control.value
+            page.update()
+
+        def comp_ratio_change(e):
+            channel["comp_ratio"] = e.control.value
+            page.update()
+
+        def delete_channel(e):
+            # No permitir borrar el canal Master
+            if channel["name"] == "Master":
+                return
+            if channel in self.channels:
+                index = self.channels.index(channel)
+                self.channels.remove(channel)
+                channels_column.controls.pop(index)
+                page.update()
+
+        return ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Text(f"Canal {channel_index+1}: {channel['name']}", size=18, weight=ft.FontWeight.BOLD, color=ft.colors.WHITE),
+                    ft.TextField(label="Nombre del Canal", value=channel["name"], on_change=name_change),
+                    ft.TextField(label="Salida", value=channel["output"], on_change=output_change),
+                    ft.Switch(label="Reverb", value=channel.get("reverb", False), on_change=toggle_reverb),
+                    ft.Slider(label="Nivel Reverb", min=0, max=1, value=channel.get("reverb_level", 0.5), on_change=reverb_level_change),
+                    ft.Switch(label="Delay", value=channel.get("delay", False), on_change=toggle_delay),
+                    ft.Slider(label="Nivel Delay", min=0, max=1, value=channel.get("delay_level", 0.5), on_change=delay_level_change),
+                    ft.Switch(label="EQ", value=channel.get("eq", False), on_change=toggle_eq),
+                    ft.Slider(label="Ganancia EQ", min=0, max=2, value=channel.get("eq_gain", 1.0), on_change=eq_gain_change),
+                    ft.Switch(label="Compresión", value=channel.get("comp", False), on_change=toggle_comp),
+                    ft.Slider(label="Umbral Compresión", min=0, max=1, value=channel.get("comp_threshold", 0.5), on_change=comp_threshold_change),
+                    ft.Slider(label="Ratio Compresión", min=1, max=10, value=channel.get("comp_ratio", 4), on_change=comp_ratio_change),
+                    ft.ElevatedButton("Eliminar Canal", on_click=delete_channel, bgcolor=ft.colors.RED)
+                ],
+                spacing=8,
+                alignment=ft.MainAxisAlignment.START
+            ),
+            padding=10,
+            bgcolor=ft.colors.BLUE_GREY_700,
+            border_radius=10,
+            margin=10
+        )
+
+    def add_channel(self, e, channels_column: ft.Column, page: ft.Page):
+        new_channel = {
+            "name": f"Canal {len(self.channels)+1}",
+            "output": "Master",
+            "reverb": False, "reverb_level": 0.5,
+            "delay": False, "delay_level": 0.5,
+            "eq": False, "eq_gain": 1.0,
+            "comp": False, "comp_threshold": 0.5, "comp_ratio": 4
+        }
+        self.channels.append(new_channel)
+        widget = self.create_channel_widget(new_channel, len(self.channels)-1, channels_column, page)
+        channels_column.controls.append(widget)
+        page.update()
+
+    # ---------------------------
+    # Construcción de la UI (Tabs principales)
+    # ---------------------------
     def main(self, page: ft.Page):
-        page.title = "Aplicación Profesional de Audio (Estilo Logic Pro)"
+        page.title = "DAW Profesional - Estilo Logic Pro / FL Studio"
         page.theme_mode = "dark"
         page.padding = 20
         page.bgcolor = "#1a1a1a"
 
-        # ----------------------------------------------------------
+        # ---------------------------
         # Pestaña "Batería"
-        # ----------------------------------------------------------
+        # ---------------------------
         kick_btn = ft.ElevatedButton(
             "BOMBO",
             width=150,
@@ -377,7 +533,7 @@ class DrumApp:
             data="hihat",
             on_click=self.play_instrument
         )
-        drum_buttons_container = ft.Row(
+        drum_buttons = ft.Row(
             controls=[kick_btn, snare_btn, hihat_btn],
             alignment=ft.MainAxisAlignment.CENTER,
             spacing=20
@@ -386,39 +542,35 @@ class DrumApp:
             content=ft.Column(
                 controls=[
                     ft.Text("Batería Digital", size=40, weight=ft.FontWeight.BOLD, color=ft.colors.WHITE, text_align=ft.TextAlign.CENTER),
-                    ft.Container(content=drum_buttons_container, margin=ft.margin.only(top=50))
+                    ft.Container(content=drum_buttons, margin=ft.margin.only(top=50))
                 ],
                 alignment=ft.MainAxisAlignment.CENTER
             )
         )
 
-        # ----------------------------------------------------------
+        # ---------------------------
         # Pestaña "Grabación"
-        # ----------------------------------------------------------
-        # Se utiliza un Row para la línea de tiempo (grabaciones y samples)
+        # ---------------------------
         timeline_row = ft.Row(controls=[], spacing=10)
-        # Se incluye un FilePicker para cargar un sample (uno a la vez) en la línea de grabación
-        file_picker = ft.FilePicker(on_result=lambda e: self.file_picker_result(e, timeline_row, page))
-        page.overlay.append(file_picker)
-
-        record_btns = ft.Row(
+        record_controls = ft.Row(
             controls=[
                 ft.ElevatedButton("Iniciar Grabación", on_click=lambda e: self.start_recording(e, page), bgcolor=ft.colors.GREEN),
                 ft.ElevatedButton("Detener Grabación", on_click=lambda e: self.stop_recording(e, page, timeline_row), bgcolor=ft.colors.RED),
                 ft.ElevatedButton("Reproducir Última Grabación", on_click=lambda e: self.play_recording(e, page)),
-                ft.ElevatedButton("Reproducir Línea de Grabación", on_click=lambda e: self.play_timeline(e, page)),
-                ft.ElevatedButton("Limpiar Línea de Grabación", on_click=lambda e: self.clear_timeline(e, page, timeline_row), bgcolor=ft.colors.ERROR),
+                ft.ElevatedButton("Reproducir Línea", on_click=lambda e: self.play_timeline(e, page)),
+                ft.ElevatedButton("Limpiar Línea", on_click=lambda e: self.clear_timeline(e, page, timeline_row), bgcolor=ft.colors.RED),
                 ft.ElevatedButton("Cargar Sample", on_click=lambda e: file_picker.pick_files(allow_multiple=False))
             ],
             alignment=ft.MainAxisAlignment.CENTER,
             spacing=10
         )
-
+        file_picker = ft.FilePicker(on_result=lambda e: self.file_picker_result(e, timeline_row, page))
+        page.overlay.append(file_picker)
         recording_tab = ft.Container(
             content=ft.Column(
                 controls=[
                     ft.Text("Grabación y Edición", size=40, weight=ft.FontWeight.BOLD, color=ft.colors.WHITE, text_align=ft.TextAlign.CENTER),
-                    ft.Container(content=record_btns, margin=ft.margin.only(top=20)),
+                    ft.Container(content=record_controls, margin=ft.margin.only(top=20)),
                     ft.Text("Línea de Grabación:", color=ft.colors.WHITE),
                     timeline_row
                 ],
@@ -427,25 +579,21 @@ class DrumApp:
             padding=20
         )
 
-        # ----------------------------------------------------------
+        # ---------------------------
         # Pestaña "Pistas" (Multitrack)
-        # ----------------------------------------------------------
-        # Se crea una columna para listar las pistas cargadas
+        # ---------------------------
         track_column = ft.Column(controls=[], spacing=10)
-        # FilePicker para cargar múltiples pistas (archivos)
-        track_file_picker = ft.FilePicker(on_result=lambda e: self.file_picker_tracks_result(e, track_column, page))
-        page.overlay.append(track_file_picker)
-
         track_controls = ft.Row(
             controls=[
                 ft.ElevatedButton("Cargar Pistas", on_click=lambda e: track_file_picker.pick_files(allow_multiple=True), bgcolor=ft.colors.GREEN),
                 ft.ElevatedButton("Reproducir Mezcla", on_click=lambda e: self.play_tracks(e, page)),
-                ft.ElevatedButton("Limpiar Pistas", on_click=lambda e: self.clear_tracks(e, page, track_column), bgcolor=ft.colors.ERROR)
+                ft.ElevatedButton("Limpiar Pistas", on_click=lambda e: self.clear_tracks(e, page, track_column), bgcolor=ft.colors.RED)
             ],
             alignment=ft.MainAxisAlignment.CENTER,
             spacing=10
         )
-
+        track_file_picker = ft.FilePicker(on_result=lambda e: self.file_picker_tracks_result(e, track_column, page))
+        page.overlay.append(track_file_picker)
         tracks_tab = ft.Container(
             content=ft.Column(
                 controls=[
@@ -459,25 +607,52 @@ class DrumApp:
             padding=20
         )
 
-        # ----------------------------------------------------------
+        # ---------------------------
+        # Pestaña "Canales" (Mixer/Efectos)
+        # ---------------------------
+        channels_column = ft.Column(controls=[], spacing=10)
+        # Crear widgets para cada canal existente
+        for idx, ch in enumerate(self.channels):
+            widget = self.create_channel_widget(ch, idx, channels_column, page)
+            channels_column.controls.append(widget)
+        channel_controls = ft.Row(
+            controls=[
+                ft.ElevatedButton("Agregar Canal", on_click=lambda e: self.add_channel(e, channels_column, page), bgcolor=ft.colors.GREEN)
+            ],
+            alignment=ft.MainAxisAlignment.CENTER,
+            spacing=10
+        )
+        channels_tab = ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Text("Mixer y Canales", size=40, weight=ft.FontWeight.BOLD, color=ft.colors.WHITE, text_align=ft.TextAlign.CENTER),
+                    ft.Container(content=channel_controls, margin=ft.margin.only(top=20)),
+                    ft.Text("Canales Configurados:", color=ft.colors.WHITE),
+                    channels_column
+                ],
+                alignment=ft.MainAxisAlignment.START
+            ),
+            padding=20
+        )
+
+        # ---------------------------
         # Tabs principales
-        # ----------------------------------------------------------
+        # ---------------------------
         tabs = ft.Tabs(
             selected_index=0,
             tabs=[
                 ft.Tab(text="Batería", content=drum_tab),
                 ft.Tab(text="Grabación", content=recording_tab),
-                ft.Tab(text="Pistas", content=tracks_tab)
+                ft.Tab(text="Pistas", content=tracks_tab),
+                ft.Tab(text="Canales", content=channels_tab)
             ]
         )
-
         page.add(tabs)
         page.update()
 
 # ==============================================================
 # Arranque de la aplicación
 # ==============================================================
-
 if __name__ == "__main__":
     app = DrumApp()
     ft.app(target=app.main)
